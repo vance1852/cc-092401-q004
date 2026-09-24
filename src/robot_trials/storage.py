@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import sqlite3
 from collections.abc import Iterator
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -101,7 +102,11 @@ CREATE TABLE IF NOT EXISTS exclusion_requests (
     requested_at TEXT NOT NULL,
     reviewed_by TEXT REFERENCES users(user_id),
     reviewed_at TEXT,
-    review_note TEXT
+    review_note TEXT,
+    revoked_by TEXT REFERENCES users(user_id),
+    revoked_at TEXT,
+    revoke_reason TEXT,
+    CHECK ((status = 'revoked') = (revoked_at IS NOT NULL))
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS one_open_exclusion_per_observation
@@ -159,6 +164,30 @@ CREATE TABLE IF NOT EXISTS audit_events (
 );
 """
 
+# 复核事实一旦写入即不可变：撤销只能写 revoked_* 列，任何改写或删除
+# reviewed_by/reviewed_at/review_note 的尝试都在数据库层被拒绝。
+TRIGGER_STATEMENTS = (
+    """
+    CREATE TRIGGER IF NOT EXISTS exclusion_review_facts_immutable
+    BEFORE UPDATE ON exclusion_requests
+    WHEN OLD.reviewed_by IS NOT NULL
+       AND (NEW.reviewed_by IS NOT OLD.reviewed_by
+            OR NEW.reviewed_at IS NOT OLD.reviewed_at
+            OR NEW.review_note IS NOT OLD.review_note)
+    BEGIN
+        SELECT RAISE(ABORT, '复核事实不可改写');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS exclusion_review_facts_no_delete
+    BEFORE DELETE ON exclusion_requests
+    WHEN OLD.reviewed_by IS NOT NULL
+    BEGIN
+        SELECT RAISE(ABORT, '复核事实不可删除');
+    END
+    """,
+)
+
 REQUIRED_TABLES = frozenset({
     "schema_meta", "protocol_catalog", "users", "robots", "builds", "batches",
     "observations", "idempotency_keys", "exclusion_requests", "analysis_jobs",
@@ -190,11 +219,65 @@ def transaction(connection: sqlite3.Connection, *, immediate: bool = False) -> I
         connection.commit()
 
 
+def _migrate_to_v3(connection: sqlite3.Connection) -> None:
+    """把 v2 的排除记录升级到带独立撤销事实的结构。
+
+    只处理缺少撤销列的旧表，可重复执行。旧代码撤销时会把撤销理由和撤销时间
+    覆盖到 review_note/reviewed_at，因此对升级前已撤销的记录做确定性归位：
+    这两列里的值移入 revoke_reason/revoked_at 并清空，恢复“原复核时间与意见
+    已不可考”的真实状态；reviewed_by 记录的是真实复核人，予以保留。撤销人
+    从未写入行内，但追加式审计链中的 exclusion.revoked 事件记录了操作人与
+    时间，用它恢复 revoked_by/revoked_at；找不到对应事件的保持 NULL，不伪造。
+    """
+
+    columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(exclusion_requests)").fetchall()
+    }
+    new_columns = {
+        "revoked_by": "ALTER TABLE exclusion_requests ADD COLUMN revoked_by TEXT REFERENCES users(user_id)",
+        "revoked_at": "ALTER TABLE exclusion_requests ADD COLUMN revoked_at TEXT",
+        "revoke_reason": "ALTER TABLE exclusion_requests ADD COLUMN revoke_reason TEXT",
+    }
+    missing = [name for name in new_columns if name not in columns]
+    if not missing:
+        return
+    for name in missing:
+        connection.execute(new_columns[name])
+    connection.execute(
+        "UPDATE exclusion_requests SET "
+        "revoked_at=reviewed_at, revoke_reason=review_note, "
+        "reviewed_at=NULL, review_note=NULL "
+        "WHERE status='revoked' AND revoked_at IS NULL"
+    )
+    events = connection.execute(
+        "SELECT event_id,actor_id,payload_json,created_at FROM audit_events "
+        "WHERE event_type='exclusion.revoked' ORDER BY event_id"
+    ).fetchall()
+    revoke_events: dict[int, sqlite3.Row] = {}
+    for event in events:
+        payload = json.loads(event["payload_json"])
+        if not isinstance(payload, dict):
+            continue
+        exclusion_id = payload.get("exclusion_id")
+        if isinstance(exclusion_id, int):
+            revoke_events[exclusion_id] = event
+    for exclusion_id, event in revoke_events.items():
+        connection.execute(
+            "UPDATE exclusion_requests SET revoked_by=?,revoked_at=? "
+            "WHERE exclusion_id=? AND status='revoked'",
+            (event["actor_id"], event["created_at"], exclusion_id),
+        )
+
+
 def initialize(connection: sqlite3.Connection) -> None:
-    """初始化基础资料表，重复执行不改变已有数据。"""
+    """初始化或升级数据库结构，重复执行不改变已有数据。"""
 
     connection.executescript(SCHEMA_SQL)
     with transaction(connection, immediate=True):
+        _migrate_to_v3(connection)
+        for statement in TRIGGER_STATEMENTS:
+            connection.execute(statement)
         connection.execute(
             "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",

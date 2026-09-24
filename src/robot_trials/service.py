@@ -275,7 +275,13 @@ class TrialService:
                     (observation_id, "pending", reason, actor_id, self._now()),
                 )
                 exclusion_id = cursor.lastrowid
-                self._audit("observation", str(observation_id), "exclusion.requested", actor_id, {"reason": reason})
+                self._audit(
+                    "exclusion",
+                    str(exclusion_id),
+                    "exclusion.requested",
+                    actor_id,
+                    {"observation_id": observation_id, "reason": reason},
+                )
         except sqlite3.IntegrityError as exc:
             raise Conflict("该观测已有待处理或生效排除") from exc
         return {"exclusion_id": exclusion_id, "status": "pending"}
@@ -300,7 +306,13 @@ class TrialService:
                 "WHERE exclusion_id=? AND status='pending'",
                 (status, actor_id, self._now(), note, exclusion_id),
             )
-            self._audit("exclusion", str(exclusion_id), f"exclusion.{status}", actor_id, {"note": note})
+            self._audit(
+                "exclusion",
+                str(exclusion_id),
+                f"exclusion.{status}",
+                actor_id,
+                {"observation_id": row["observation_id"], "note": note},
+            )
         return {"exclusion_id": exclusion_id, "status": status}
 
     def revoke_exclusion(self, actor_id: str, exclusion_id: int, reason: str) -> dict[str, Any]:
@@ -321,18 +333,23 @@ class TrialService:
             raise InvalidState("批次封存后不能改变排除状态")
         with transaction(self.connection, immediate=True):
             cursor = self.connection.execute(
-                "UPDATE exclusion_requests SET status='revoked',review_note=?,reviewed_at=? "
+                "UPDATE exclusion_requests SET status='revoked',revoked_by=?,revoked_at=?,revoke_reason=? "
                 "WHERE exclusion_id=? AND status='approved'",
-                (reason, self._now(), exclusion_id),
+                (actor_id, self._now(), reason, exclusion_id),
             )
             if cursor.rowcount != 1:
                 raise InvalidState("排除状态已变化")
             self._audit(
-                "observation",
-                str(row["observation_id"]),
+                "exclusion",
+                str(exclusion_id),
                 "exclusion.revoked",
                 actor_id,
-                {"exclusion_id": exclusion_id, "reason": reason},
+                {
+                    "observation_id": row["observation_id"],
+                    "reason": reason,
+                    "reviewed_by": row["reviewed_by"],
+                    "reviewed_at": row["reviewed_at"],
+                },
             )
         return {"exclusion_id": exclusion_id, "status": "revoked"}
 
@@ -529,14 +546,18 @@ class TrialService:
                 "SELECT * FROM decisions WHERE analysis_id=?", (analysis_row["analysis_id"],)
             ).fetchone()
         exclusions = self.connection.execute(
-            "SELECT e.exclusion_id,e.observation_id,e.status,e.reason,e.requested_by,e.reviewed_by "
+            "SELECT e.exclusion_id,e.observation_id,e.status,e.reason,e.requested_by,e.requested_at,"
+            "e.reviewed_by,e.reviewed_at,e.review_note,e.revoked_by,e.revoked_at,e.revoke_reason "
             "FROM exclusion_requests e JOIN observations o ON o.observation_id=e.observation_id "
             "WHERE o.batch_id=? ORDER BY e.exclusion_id", (batch_id,)
         ).fetchall()
         events = self.connection.execute(
-            "SELECT event_type,actor_id,payload_json,created_at FROM audit_events "
-            "WHERE entity_type='batch' AND entity_id=? "
-            "ORDER BY event_id", (batch_id,)
+            "SELECT event_type,entity_type,entity_id,actor_id,payload_json,created_at FROM audit_events "
+            "WHERE (entity_type='batch' AND entity_id=?) "
+            "OR (entity_type='exclusion' AND entity_id IN ("
+            "SELECT CAST(e.exclusion_id AS TEXT) FROM exclusion_requests e "
+            "JOIN observations o ON o.observation_id=e.observation_id WHERE o.batch_id=?)) "
+            "ORDER BY event_id", (batch_id, batch_id)
         ).fetchall()
         return {
             "batch": batch,

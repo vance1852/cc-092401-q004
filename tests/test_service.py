@@ -23,6 +23,7 @@ class ServiceTests(unittest.TestCase):
         self.service = TrialService(self.connection, self.clock)
         for user_id, role in (
             ("operator", "operator"),
+            ("operator-2", "operator"),
             ("stat", "statistician"),
             ("approver", "approver"),
             ("auditor", "auditor"),
@@ -80,21 +81,140 @@ class ServiceTests(unittest.TestCase):
         with self.assertRaises(Forbidden):
             self.service.report("operator", "batch-a")
 
-    def test_exclusion_review_and_revoke_leave_history(self) -> None:
-        self.service.import_observations("operator", "batch-a", "key-1", self.rows)
+    def _create_approved_exclusion(self, note: str = "证据充分") -> tuple[int, int, dict]:
+        imported = self.service.import_observations("operator", "batch-a", "key-1", self.rows)
+        self.assertEqual(imported["inserted"], 6)
         observation_id = self.connection.execute(
             "SELECT observation_id FROM observations ORDER BY observation_id LIMIT 1"
         ).fetchone()[0]
         requested = self.service.request_exclusion("operator", observation_id, "现场记录失效")
-        reviewed = self.service.review_exclusion("stat", requested["exclusion_id"], True, "证据充分")
+        exclusion_id = requested["exclusion_id"]
+        self.clock.advance(seconds=10)
+        reviewed = self.service.review_exclusion("stat", exclusion_id, True, note)
         self.assertEqual(reviewed["status"], "approved")
-        revoked = self.service.revoke_exclusion("operator", requested["exclusion_id"], "已找回原始记录")
+        before = dict(
+            self.connection.execute(
+                "SELECT reviewed_by,reviewed_at,review_note FROM exclusion_requests "
+                "WHERE exclusion_id=?",
+                (exclusion_id,),
+            ).fetchone()
+        )
+        self.clock.advance(seconds=20)
+        return exclusion_id, observation_id, before
+
+    def test_revoke_records_separate_facts_without_touching_review(self) -> None:
+        exclusion_id, observation_id, before = self._create_approved_exclusion()
+        revoked = self.service.revoke_exclusion("operator", exclusion_id, "已找回原始记录")
         self.assertEqual(revoked["status"], "revoked")
+        row = dict(
+            self.connection.execute(
+                "SELECT * FROM exclusion_requests WHERE exclusion_id=?", (exclusion_id,)
+            ).fetchone()
+        )
+        # 最初复核事实必须原样保留。
+        self.assertEqual(row["reviewed_by"], before["reviewed_by"])
+        self.assertEqual(row["reviewed_at"], before["reviewed_at"])
+        self.assertEqual(row["review_note"], before["review_note"])
+        self.assertEqual(row["reviewed_by"], "stat")
+        self.assertEqual(row["review_note"], "证据充分")
+        self.assertLess(row["reviewed_at"], row["revoked_at"])
+        # 撤销事实独立记录。
+        self.assertEqual(row["revoked_by"], "operator")
+        self.assertEqual(row["revoke_reason"], "已找回原始记录")
+        self.assertIsNotNone(row["revoked_at"])
+
+    def test_review_and_revocation_are_two_distinguishable_facts_in_event_chain(self) -> None:
+        exclusion_id, _, _ = self._create_approved_exclusion()
+        self.service.revoke_exclusion("operator", exclusion_id, "已找回原始记录")
         events = self.connection.execute(
-            "SELECT event_type FROM audit_events WHERE entity_type='observation' AND entity_id=? ORDER BY event_id",
-            (str(observation_id),),
+            "SELECT event_type,actor_id FROM audit_events WHERE entity_type='exclusion' "
+            "AND entity_id=? ORDER BY event_id",
+            (str(exclusion_id),),
         ).fetchall()
-        self.assertEqual([row[0] for row in events], ["exclusion.requested", "exclusion.revoked"])
+        self.assertEqual(
+            [(row[0], row[1]) for row in events],
+            [
+                ("exclusion.requested", "operator"),
+                ("exclusion.approved", "stat"),
+                ("exclusion.revoked", "operator"),
+            ],
+        )
+
+    def test_report_shows_review_and_revocation_as_separate_facts(self) -> None:
+        exclusion_id, _, _ = self._create_approved_exclusion()
+        self.service.revoke_exclusion("operator", exclusion_id, "已找回原始记录")
+        report = self.service.report("auditor", "batch-a")
+        matches = [item for item in report["exclusions"] if item["exclusion_id"] == exclusion_id]
+        self.assertEqual(len(matches), 1)
+        entry = matches[0]
+        self.assertEqual(entry["status"], "revoked")
+        self.assertEqual(entry["reviewed_by"], "stat")
+        self.assertEqual(entry["review_note"], "证据充分")
+        self.assertEqual(entry["revoked_by"], "operator")
+        self.assertEqual(entry["revoke_reason"], "已找回原始记录")
+        chain = [event["event_type"] for event in report["events"] if event["entity_type"] == "exclusion"]
+        self.assertEqual(chain, ["exclusion.requested", "exclusion.approved", "exclusion.revoked"])
+
+    def test_duplicate_revoke_is_rejected_and_leaves_review_intact(self) -> None:
+        exclusion_id, _, before = self._create_approved_exclusion()
+        self.service.revoke_exclusion("operator", exclusion_id, "第一次撤销")
+        with self.assertRaises(InvalidState):
+            self.service.revoke_exclusion("operator", exclusion_id, "重复撤销")
+        row = self.connection.execute(
+            "SELECT reviewed_by,reviewed_at,review_note,revoked_by,revoke_reason "
+            "FROM exclusion_requests WHERE exclusion_id=?",
+            (exclusion_id,),
+        ).fetchone()
+        self.assertEqual(row["review_note"], before["review_note"])
+        self.assertEqual(row["reviewed_at"], before["reviewed_at"])
+        self.assertEqual(row["revoke_reason"], "第一次撤销")
+
+    def test_revoke_after_seal_is_rejected(self) -> None:
+        exclusion_id, _, before = self._create_approved_exclusion()
+        self.service.seal_batch("stat", "batch-a", 2)
+        with self.assertRaises(InvalidState):
+            self.service.revoke_exclusion("operator", exclusion_id, "封存后撤销")
+        row = self.connection.execute(
+            "SELECT status,reviewed_by,reviewed_at,review_note,revoked_at "
+            "FROM exclusion_requests WHERE exclusion_id=?",
+            (exclusion_id,),
+        ).fetchone()
+        self.assertEqual(row["status"], "approved")
+        self.assertEqual(row["review_note"], before["review_note"])
+        self.assertEqual(row["reviewed_at"], before["reviewed_at"])
+        self.assertIsNone(row["revoked_at"])
+
+    def test_non_requester_cannot_revoke(self) -> None:
+        exclusion_id, _, before = self._create_approved_exclusion()
+        with self.assertRaises(Forbidden):
+            self.service.revoke_exclusion("operator-2", exclusion_id, "非申请人撤销")
+        with self.assertRaises(Forbidden):
+            self.service.revoke_exclusion("stat", exclusion_id, "复核人撤销")
+        row = self.connection.execute(
+            "SELECT status,reviewed_by,reviewed_at,review_note,revoked_at "
+            "FROM exclusion_requests WHERE exclusion_id=?",
+            (exclusion_id,),
+        ).fetchone()
+        self.assertEqual(row["status"], "approved")
+        self.assertEqual(row["review_note"], before["review_note"])
+        self.assertEqual(row["reviewed_at"], before["reviewed_at"])
+        self.assertIsNone(row["revoked_at"])
+
+    def test_revoked_exclusion_is_no_longer_applied_to_analysis(self) -> None:
+        exclusion_id, _, _ = self._create_approved_exclusion()
+        applied = self.connection.execute(
+            "SELECT count(*) FROM observations o JOIN exclusion_requests e "
+            "ON e.observation_id=o.observation_id AND e.status='approved' "
+            "WHERE o.batch_id='batch-a'"
+        ).fetchone()[0]
+        self.assertEqual(applied, 1)
+        self.service.revoke_exclusion("operator", exclusion_id, "已找回原始记录")
+        applied_after = self.connection.execute(
+            "SELECT count(*) FROM observations o JOIN exclusion_requests e "
+            "ON e.observation_id=o.observation_id AND e.status='approved' "
+            "WHERE o.batch_id='batch-a'"
+        ).fetchone()[0]
+        self.assertEqual(applied_after, 0)
 
     def test_failed_job_returns_to_queue_after_delay(self) -> None:
         self.service.import_observations("operator", "batch-a", "key-1", self.rows)

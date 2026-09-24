@@ -262,6 +262,8 @@ class TrialService:
 
     def request_exclusion(self, actor_id: str, observation_id: int, reason: str) -> dict[str, Any]:
         self._require(actor_id, "exclusion.request")
+        if not reason.strip():
+            raise ValidationFailed("排除理由不能为空")
         observation = self.connection.execute(
             "SELECT observation_id,batch_id FROM observations WHERE observation_id=?", (observation_id,)
         ).fetchone()
@@ -275,7 +277,13 @@ class TrialService:
                     (observation_id, "pending", reason, actor_id, self._now()),
                 )
                 exclusion_id = cursor.lastrowid
-                self._audit("observation", str(observation_id), "exclusion.requested", actor_id, {"reason": reason})
+                self._audit(
+                    "exclusion",
+                    str(exclusion_id),
+                    "exclusion.requested",
+                    actor_id,
+                    {"observation_id": observation_id, "reason": reason},
+                )
         except sqlite3.IntegrityError as exc:
             raise Conflict("该观测已有待处理或生效排除") from exc
         return {"exclusion_id": exclusion_id, "status": "pending"}
@@ -294,17 +302,26 @@ class TrialService:
         if row["requested_by"] == actor_id:
             raise Forbidden("申请人不能复核自己的排除申请")
         status = "approved" if approve else "rejected"
+        now = self._now()
         with transaction(self.connection, immediate=True):
             self.connection.execute(
                 "UPDATE exclusion_requests SET status=?,reviewed_by=?,reviewed_at=?,review_note=? "
                 "WHERE exclusion_id=? AND status='pending'",
-                (status, actor_id, self._now(), note, exclusion_id),
+                (status, actor_id, now, note, exclusion_id),
             )
-            self._audit("exclusion", str(exclusion_id), f"exclusion.{status}", actor_id, {"note": note})
+            self._audit(
+                "exclusion",
+                str(exclusion_id),
+                f"exclusion.{status}",
+                actor_id,
+                {"note": note, "reviewed_at": now},
+            )
         return {"exclusion_id": exclusion_id, "status": status}
 
     def revoke_exclusion(self, actor_id: str, exclusion_id: int, reason: str) -> dict[str, Any]:
         self._require(actor_id, "exclusion.revoke")
+        if not reason.strip():
+            raise ValidationFailed("撤销理由不能为空")
         row = self.connection.execute(
             "SELECT e.*,o.batch_id FROM exclusion_requests e "
             "JOIN observations o ON o.observation_id=e.observation_id WHERE e.exclusion_id=?",
@@ -312,6 +329,7 @@ class TrialService:
         ).fetchone()
         if row is None:
             raise NotFound("排除记录不存在")
+        # 重复撤销（含撤销被拒绝/待处理的记录）一律拒绝，保证状态机一致。
         if row["status"] != "approved":
             raise InvalidState("只有已批准的排除可以撤销")
         if row["requested_by"] != actor_id:
@@ -320,19 +338,30 @@ class TrialService:
         if batch["state"] != "running":
             raise InvalidState("批次封存后不能改变排除状态")
         with transaction(self.connection, immediate=True):
+            # 只追加撤销事实并切换当前状态；SET 子句不包含任何 reviewed_* 列，
+            # 数据库触发器也会拒绝任何对原始复核事实的改写。
             cursor = self.connection.execute(
-                "UPDATE exclusion_requests SET status='revoked',review_note=?,reviewed_at=? "
-                "WHERE exclusion_id=? AND status='approved'",
-                (reason, self._now(), exclusion_id),
+                "UPDATE exclusion_requests SET status='revoked',revoked_by=?,revoked_at=?,revoke_reason=? "
+                "WHERE exclusion_id=? AND status='approved' AND revoked_at IS NULL",
+                (actor_id, self._now(), reason, exclusion_id),
             )
             if cursor.rowcount != 1:
                 raise InvalidState("排除状态已变化")
             self._audit(
-                "observation",
-                str(row["observation_id"]),
+                "exclusion",
+                str(exclusion_id),
                 "exclusion.revoked",
                 actor_id,
-                {"exclusion_id": exclusion_id, "reason": reason},
+                {
+                    "observation_id": row["observation_id"],
+                    "reason": reason,
+                    # 事件链中同时固化最初的批准证据，撤销与批准是两个可区分事实。
+                    "original_review": {
+                        "reviewed_by": row["reviewed_by"],
+                        "reviewed_at": row["reviewed_at"],
+                        "review_note": row["review_note"],
+                    },
+                },
             )
         return {"exclusion_id": exclusion_id, "status": "revoked"}
 
@@ -529,14 +558,33 @@ class TrialService:
                 "SELECT * FROM decisions WHERE analysis_id=?", (analysis_row["analysis_id"],)
             ).fetchone()
         exclusions = self.connection.execute(
-            "SELECT e.exclusion_id,e.observation_id,e.status,e.reason,e.requested_by,e.reviewed_by "
+            "SELECT e.exclusion_id,e.observation_id,e.status,e.reason,e.requested_by,e.requested_at,"
+            "e.reviewed_by,e.reviewed_at,e.review_note,e.revoked_by,e.revoked_at,e.revoke_reason "
             "FROM exclusion_requests e JOIN observations o ON o.observation_id=e.observation_id "
             "WHERE o.batch_id=? ORDER BY e.exclusion_id", (batch_id,)
         ).fetchall()
+        exclusion_facts = []
+        for row in exclusions:
+            item = dict(row)
+            # 批准与撤销是两个独立事实，分别成组呈现，当前状态不改变任何一组。
+            item["review"] = None if row["reviewed_by"] is None else {
+                "reviewed_by": row["reviewed_by"],
+                "reviewed_at": row["reviewed_at"],
+                "review_note": row["review_note"],
+            }
+            item["revocation"] = None if row["revoked_at"] is None else {
+                "revoked_by": row["revoked_by"],
+                "revoked_at": row["revoked_at"],
+                "revoke_reason": row["revoke_reason"],
+            }
+            exclusion_facts.append(item)
         events = self.connection.execute(
-            "SELECT event_type,actor_id,payload_json,created_at FROM audit_events "
-            "WHERE entity_type='batch' AND entity_id=? "
-            "ORDER BY event_id", (batch_id,)
+            "SELECT entity_type,entity_id,event_type,actor_id,payload_json,created_at FROM audit_events "
+            "WHERE (entity_type='batch' AND entity_id=?) "
+            "OR (entity_type='exclusion' AND entity_id IN ("
+            "    SELECT CAST(e.exclusion_id AS TEXT) FROM exclusion_requests e "
+            "    JOIN observations o ON o.observation_id=e.observation_id WHERE o.batch_id=?)) "
+            "ORDER BY event_id", (batch_id, batch_id)
         ).fetchall()
         return {
             "batch": batch,
@@ -555,6 +603,8 @@ class TrialService:
                 "result": json.loads(analysis_row["result_json"]),
             },
             "decision": None if decision_row is None else dict(decision_row),
-            "exclusions": [dict(row) for row in exclusions],
-            "events": [dict(row) | {"payload": json.loads(row["payload_json"])} for row in events],
+            "exclusions": exclusion_facts,
+            "events": [
+                dict(row) | {"payload": json.loads(row["payload_json"])} for row in events
+            ],
         }
